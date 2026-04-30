@@ -1,7 +1,6 @@
 {
-  "name": "taixiu-pro-max",
-  "version": "4.0.0",
-  "description": "API Tài Xỉu VIP by vanminh2603",
+  "name": "taixiu-ai-final",
+  "version": "6.0.0",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
