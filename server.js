@@ -9,16 +9,26 @@ const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
 const PORT = process.env.PORT || 3000;
-
 const FIREBASE = "https://gb-8e4c1-default-rtdb.firebaseio.com/taixiu_sessions/current.json";
-const MONGO = "mongodb://127.0.0.1:27017/taixiu";
 
 // =========================
-// CONNECT DB
+// DB (fallback RAM)
 // =========================
-mongoose.connect(MONGO);
+let useMongo = false;
+let history = [];
 
-const Session = mongoose.model("Session", new mongoose.Schema({
+const MONGO = process.env.MONGO_URI || "";
+
+if (MONGO) {
+  mongoose.connect(MONGO)
+    .then(() => {
+      console.log("✅ Mongo OK");
+      useMongo = true;
+    })
+    .catch(() => console.log("⚠️ Mongo lỗi → dùng RAM"));
+}
+
+const Session = mongoose.models.Session || mongoose.model("Session", new mongoose.Schema({
   phien: Number,
   xuc_xac: [Number],
   tong: Number,
@@ -27,81 +37,104 @@ const Session = mongoose.model("Session", new mongoose.Schema({
 }));
 
 // =========================
-// TOKEN
+// AI PRO (Markov + pattern + streak)
 // =========================
-const token = (p) => "VM-" + p + "-" + Date.now().toString(36);
-
-// =========================
-// MARKOV BẬC 2 + WEIGHT
-// =========================
-async function markov2() {
-  const data = await Session.find().sort({ createdAt: -1 }).limit(30);
-  if (data.length < 6) return { du_doan: "Không đủ dữ liệu", ti_le: "0%" };
-
-  let map = {};
-
-  for (let i = 0; i < data.length - 2; i++) {
-    let key = data[i].ket_qua + "-" + data[i + 1].ket_qua;
-    let next = data[i + 2].ket_qua;
-
-    if (!map[key]) map[key] = { "Tài": 0, "Xỉu": 0 };
-
-    // weighting: gần hiện tại = trọng số cao
-    let weight = data.length - i;
-    map[key][next] += weight;
+function aiPro(data) {
+  if (data.length < 10) {
+    return { du_doan: "Không đủ dữ liệu", do_tin_cay: 0 };
   }
 
-  let currentKey = data[0].ket_qua + "-" + data[1].ket_qua;
-  let stat = map[currentKey];
+  let score = { Tài: 0, Xỉu: 0 };
 
-  if (!stat) return { du_doan: "Không rõ", ti_le: "50%" };
+  // Markov + weight
+  for (let i = 0; i < data.length - 2; i++) {
+    let next = data[i + 2].ket_qua;
+    let weight = data.length - i;
+    score[next] += weight * 1.5;
+  }
 
-  let predict = stat["Tài"] > stat["Xỉu"] ? "Tài" : "Xỉu";
-  let total = stat["Tài"] + stat["Xỉu"];
+  // streak (bệt)
+  let streak = 1;
+  for (let i = 0; i < data.length - 1; i++) {
+    if (data[i].ket_qua === data[i + 1].ket_qua) streak++;
+    else break;
+  }
+
+  if (streak >= 3) {
+    score[data[0].ket_qua] += streak * 2;
+  }
+
+  // đảo
+  let alternating = true;
+  for (let i = 0; i < 6; i++) {
+    if (data[i].ket_qua === data[i + 1].ket_qua) {
+      alternating = false;
+      break;
+    }
+  }
+
+  if (alternating) {
+    let next = data[0].ket_qua === "Tài" ? "Xỉu" : "Tài";
+    score[next] += 8;
+  }
+
+  let predict = score.Tài > score.Xỉu ? "Tài" : "Xỉu";
+  let total = score.Tài + score.Xỉu;
+
+  let percent = total
+    ? ((Math.max(score.Tài, score.Xỉu) / total) * 100).toFixed(2)
+    : 50;
 
   return {
     du_doan: predict,
-    ti_le: ((Math.max(stat["Tài"], stat["Xỉu"]) / total) * 100).toFixed(2) + "%",
-    cau: currentKey
+    do_tin_cay: percent
   };
 }
 
 // =========================
-// PHÁT HIỆN CẦU
+// CẦU
 // =========================
-async function detectCau() {
-  const data = await Session.find().sort({ createdAt: -1 }).limit(10);
+function detectCau(data) {
   let seq = data.map(x => x.ket_qua);
 
-  // bệt (lặp)
-  if (seq.every(x => x === seq[0])) {
-    return "Cầu bệt " + seq[0];
-  }
+  if (seq.every(x => x === seq[0])) return "Cầu bệt " + seq[0];
 
-  // đảo
   let dao = true;
   for (let i = 0; i < seq.length - 1; i++) {
     if (seq[i] === seq[i + 1]) dao = false;
   }
   if (dao) return "Cầu đảo";
 
-  // gãy (đổi hướng)
-  if (seq[0] !== seq[1] && seq[1] === seq[2]) {
-    return "Cầu gãy";
-  }
+  if (seq[0] !== seq[1] && seq[1] === seq[2]) return "Cầu gãy";
 
   return "Không rõ";
 }
 
 // =========================
-// REALTIME CLIENTS (SSE)
+// CẢNH BÁO
 // =========================
-let clients = [];
+function canhBao(p) {
+  let v = parseFloat(p);
+  if (v >= 70) return "VÀO MẠNH";
+  if (v >= 60) return "CÓ THỂ VÀO";
+  return "KHÔNG NÊN VÀO";
+}
 
 // =========================
-// SYNC DATA
+// GET DATA
+// =========================
+async function getData() {
+  if (useMongo) {
+    return await Session.find().sort({ createdAt: -1 }).limit(50);
+  }
+  return history;
+}
+
+// =========================
+// SYNC
 // =========================
 let lastPhien = null;
+let clients = [];
 
 async function sync() {
   try {
@@ -112,90 +145,84 @@ async function sync() {
 
     lastPhien = d.Phien;
 
-    const newData = await Session.create({
+    const obj = {
       phien: d.Phien,
       xuc_xac: [d.xuc_xac_1, d.xuc_xac_2, d.xuc_xac_3],
       tong: d.tong,
       ket_qua: d.ket_qua
-    });
-
-    // giữ 50
-    const count = await Session.countDocuments();
-    if (count > 50) {
-      const old = await Session.findOne().sort({ createdAt: 1 });
-      await Session.deleteOne({ _id: old._id });
-    }
-
-    // AI
-    const mk = await markov2();
-    const cau = await detectCau();
-
-    const payload = {
-      phien: newData.phien,
-      ket_qua: newData.ket_qua,
-      tong: newData.tong,
-      xuc_xac: newData.xuc_xac,
-
-      du_doan: mk.du_doan,
-      ti_le: mk.ti_le,
-      cau: cau,
-
-      token: token(newData.phien),
-      chu_ky: "@vanminh2603"
     };
 
-    // SSE push
+    if (useMongo) {
+      await Session.create(obj);
+    } else {
+      history.unshift(obj);
+      if (history.length > 50) history.pop();
+    }
+
+    const data = await getData();
+    const ai = aiPro(data);
+    const cau = detectCau(data);
+
+    const payload = {
+      ...obj,
+      du_doan: ai.du_doan,
+      do_tin_cay: ai.do_tin_cay + "%",
+      canh_bao: canhBao(ai.do_tin_cay),
+      cau
+    };
+
+    // SSE
     clients.forEach(c => c.write(`data: ${JSON.stringify(payload)}\n\n`));
 
-    // WS push
-    wss.clients.forEach(client => {
-      if (client.readyState === 1) {
-        client.send(JSON.stringify(payload));
-      }
+    // WS
+    wss.clients.forEach(ws => {
+      if (ws.readyState === 1) ws.send(JSON.stringify(payload));
     });
 
-    console.log("📡 Realtime:", payload);
+    console.log("📡", payload);
 
-  } catch (err) {
-    console.log("❌ Sync lỗi:", err.message);
+  } catch (e) {
+    console.log("❌", e.message);
   }
 }
 
 setInterval(sync, 2000);
 
 // =========================
-// API JSON
+// ROUTES
 // =========================
-app.get("/taixiu", async (req, res) => {
-  const last = await Session.findOne().sort({ createdAt: -1 });
-  if (!last) return res.json({ status: "loading" });
+app.get("/", (req, res) => {
+  res.send("API Tài Xỉu AI đang chạy 🚀");
+});
 
-  const mk = await markov2();
-  const cau = await detectCau();
+app.get("/taixiu", async (req, res) => {
+  const data = await getData();
+  if (!data.length) return res.json({ status: "loading" });
+
+  const ai = aiPro(data);
+  const cau = detectCau(data);
+  const c = data[0];
 
   res.json({
-    phien: last.phien,
-    ket_qua: last.ket_qua,
-    tong: last.tong,
-    xuc_xac: last.xuc_xac,
+    phien: c.phien,
+    ket_qua: c.ket_qua,
+    tong: c.tong,
+    xuc_xac: c.xuc_xac,
 
-    du_doan: mk.du_doan,
-    ti_le: mk.ti_le,
-    cau: cau,
+    du_doan: ai.du_doan,
+    do_tin_cay: ai.do_tin_cay + "%",
+    canh_bao: canhBao(ai.do_tin_cay),
 
-    token: token(last.phien),
-    chu_ky: "@vanminh2603"
+    cau
   });
 });
 
-// =========================
-// SSE STREAM
-// =========================
+// SSE
 app.get("/stream", (req, res) => {
   res.set({
     "Content-Type": "text/event-stream",
     "Cache-Control": "no-cache",
-    "Connection": "keep-alive"
+    Connection: "keep-alive"
   });
 
   res.flushHeaders();
@@ -206,14 +233,12 @@ app.get("/stream", (req, res) => {
   });
 });
 
-// =========================
-// WS STREAM
-// =========================
-wss.on("connection", ws => {
-  console.log("🔌 WS client connected");
+// WS
+wss.on("connection", () => {
+  console.log("🔌 WS connected");
 });
 
 // =========================
 server.listen(PORT, () => {
-  console.log("🚀 PRO MAX chạy:", PORT);
+  console.log("🚀 RUN PORT", PORT);
 });
